@@ -72,7 +72,7 @@ async def main():
     @dp.callback_query(F.data == "toggle_privacy")
     async def toggle_privacy(call: CallbackQuery):
         status = db_query("SELECT is_hidden FROM users WHERE user_id = ?", (call.from_user.id,), fetchone=True)
-        if status:
+        if status is not None:
             new_status = 1 if status[0] == 0 else 0
             db_query("UPDATE users SET is_hidden = ? WHERE user_id = ?", (new_status, call.from_user.id), commit=True)
             await call.answer("Настройки приватности изменены ✅", show_alert=True)
@@ -96,7 +96,8 @@ async def main():
                 await bot.send_message(user_id, "<b>📩 Вам пришел ответ от администратора!</b>")
                 await m.copy_to(user_id)
                 await m.answer("✅ Отправлено!")
-            except:
+            except Exception as e:
+                logging.error(f"Error reply: {e}")
                 await m.answer("❌ Ошибка доставки.")
 
     @dp.message(Form.waiting_for_msg)
@@ -109,14 +110,15 @@ async def main():
         footer = "\n\n<i>↪️ Свайпни для ответа.</i>"
         try:
             if m.text:
-                sent = await bot.send_message(ADMIN_ID, f"{header}<blockquote>{m.text}</blockquote>{footer}")
+                sent = await bot.send_message(chat_id=ADMIN_ID, text=f"{header}<blockquote>{m.text}</blockquote>{footer}")
             else:
                 cap = m.caption if m.caption else "(Медиафайл)"
-                txt_header = await bot.send_message(ADMIN_ID, f"{header}<blockquote>{cap}</blockquote>{footer}")
-                sent = await m.copy_message(ADMIN_ID, m.chat.id, m.message_id, reply_to_message_id=txt_header.message_id)
+                txt_header = await bot.send_message(chat_id=ADMIN_ID, text=f"{header}<blockquote>{cap}</blockquote>{footer}")
+                sent = await bot.copy_message(chat_id=ADMIN_ID, from_chat_id=m.chat.id, message_id=m.message_id, reply_to_message_id=txt_header.message_id)
             db_query("INSERT INTO msgs (admin_msg_id, user_id) VALUES (?, ?)", (sent.message_id, m.from_user.id), commit=True)
             await m.answer("🚀 <b>Доставлено!</b>", reply_markup=main_kb)
-        except:
+        except Exception as e:
+            logging.error(f"Error send: {e}")
             await m.answer("❌ Ошибка отправки.")
         await state.clear()
 
@@ -125,3 +127,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+ 

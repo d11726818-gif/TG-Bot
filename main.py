@@ -1,101 +1,127 @@
+import os
 import asyncio
-import hashlib
+import sqlite3
+import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
-TOKEN = "ВАШ_ТОКЕН"
-MY_ID = 0
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-
-u_map = {}
-stats = {}
+ADMIN_ID = 123456789 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 class Form(StatesGroup):
-    wait_msg = State()
+    waiting_for_msg = State()
 
-def main_kb():
-    kb = [
-        [KeyboardButton(text="📝 Написать анонимно")],
-        [KeyboardButton(text="🏆 Топ"), KeyboardButton(text="🔑 Мой ID")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+logging.basicConfig(level=logging.INFO)
+DB_PATH = "/data/feedback_private.db" if os.path.exists("/data") else "feedback_private.db"
 
-def get_hash(uid: int):
-    h = hashlib.sha256(str(uid).encode()).hexdigest()[:12]
-    u_map[h] = uid
-    return h
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS users 
+                   (user_id INTEGER PRIMARY KEY, name TEXT, count INTEGER DEFAULT 0, is_hidden INTEGER DEFAULT 0)''')
+    cur.execute('CREATE TABLE IF NOT EXISTS msgs (admin_msg_id INTEGER PRIMARY KEY, user_id INTEGER, is_read INTEGER DEFAULT 0)')
+    conn.commit()
+    conn.close()
 
-@dp.message(Command("start"))
-async def start(msg: types.Message):
-    await msg.answer(
-        "Приватный чат. Твой профиль скрыт хешем.\n"
-        "Админ видит только ID-тикета. Никаких логов нет.",
-        reply_markup=main_kb()
-    )
-
-@dp.message(F.text == "🔑 Мой ID")
-async def my_id(msg: types.Message):
-    tid = get_hash(msg.from_user.id)
-    await msg.answer(f"Твой ID: {tid}")
-
-@dp.message(F.text == "🏆 Топ")
-async def show_top(msg: types.Message):
-    if not stats:
-        return await msg.answer("Топ пуст")
-    
-    top = sorted(stats.items(), key=lambda x: x[1], reverse=True)[:5]
-    res = "🏆 ТОП АКТИВНОСТИ:\n\n"
-    for i, (uid, count) in enumerate(top, 1):
-        res += f"{i}. {get_hash(uid)} — {count} сообщ.\n"
-    await msg.answer(res)
-
-@dp.message(F.text == "📝 Написать анонимно")
-async def go_send(msg: types.Message, state: FSMContext):
-    await msg.answer("Жду сообщение (текст/фото/кружок/гиф):")
-    await state.set_state(Form.wait_msg)
-
-@dp.message(Form.wait_msg)
-async def send_msg(msg: types.Message, state: FSMContext):
-    uid = msg.from_user.id
-    tid = get_hash(uid)
-    head = f"От: {tid}\n"
-    
+def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    res = None
     try:
-        stats[uid] = stats.get(uid, 0) + 1
-        await msg.copy_to(MY_ID, caption=head)
-        
-        if not msg.caption and not any([msg.photo, msg.video, msg.voice, msg.video_note, msg.animation]):
-            if msg.text:
-                await bot.send_message(MY_ID, head + msg.text)
+        cur.execute(query, params)
+        if fetchone:
+            res = cur.fetchone()
+        elif fetchall:
+            res = cur.fetchall()
+        if commit:
+            conn.commit()
+    finally:
+        conn.close()
+    return res
 
-        await msg.answer(f"Отправлено. Твой ID: {tid}")
-    except:
-        await msg.answer("Ошибка")
-    
-    await state.clear()
+async def main():
+    if not BOT_TOKEN: return
+    init_db()
+    bot = Bot(token=BOT_TOKEN.strip(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
 
-@dp.message(F.reply_to_message & (F.chat.id == MY_ID))
-async def answer(msg: types.Message):
-    try:
-        text = msg.reply_to_message.text or msg.reply_to_message.caption
-        tid = text.split('От: ')[1].split('\n')[0].strip()
-        uid = u_map.get(tid)
-        
-        if uid:
-            await msg.copy_to(uid)
-            await msg.answer("Ок, ушло.")
+    main_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✍️ Написать сообщение")], [KeyboardButton(text="🏆 Топ активных")]], resize_keyboard=True)
+
+    @dp.message(Command("start"))
+    async def cmd_start(m: Message, state: FSMContext):
+        await state.clear()
+        await m.answer("<b>👋 Привет!</b> Выберите действие:", reply_markup=main_kb)
+
+    @dp.message(F.text == "🏆 Топ активных")
+    async def btn_top(m: Message):
+        rows = db_query("SELECT name, count FROM users WHERE is_hidden = 0 ORDER BY count DESC LIMIT 10", fetchall=True)
+        top_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔒 Скрыть/Показать меня", callback_data="toggle_privacy")]])
+        res = "🏆 <b>Топ активных пользователей:</b>\n\n"
+        if not rows:
+            res += "📊 Список пока пуст."
         else:
-            await msg.answer("ID не найден в памяти")
-    except:
-        await msg.answer("Нужно ответить на сообщение")
+            for i, (name, count) in enumerate(rows, 1):
+                res += f"{i}. {name} — <code>{count}</code>\n"
+        await m.answer(res, reply_markup=top_kb)
 
-async def run():
+    @dp.callback_query(F.data == "toggle_privacy")
+    async def toggle_privacy(call: CallbackQuery):
+        status = db_query("SELECT is_hidden FROM users WHERE user_id = ?", (call.from_user.id,), fetchone=True)
+        if status:
+            new_status = 1 if status[0] == 0 else 0
+            db_query("UPDATE users SET is_hidden = ? WHERE user_id = ?", (new_status, call.from_user.id), commit=True)
+            await call.answer("Настройки приватности изменены ✅", show_alert=True)
+        else:
+            await call.answer("Вы еще не писали боту!", show_alert=True)
+
+    @dp.message(F.text == "✍️ Написать сообщение")
+    async def btn_write(m: Message, state: FSMContext):
+        await m.answer("<b>📝 Жду ваше сообщение:</b>")
+        await state.set_state(Form.waiting_for_msg)
+
+    @dp.message(F.reply_to_message, F.from_user.id == ADMIN_ID)
+    async def admin_reply(m: Message):
+        data = db_query("SELECT user_id, is_read FROM msgs WHERE admin_msg_id = ?", (m.reply_to_message.message_id,), fetchone=True)
+        if data:
+            user_id, is_read = data
+            try:
+                if is_read == 0:
+                    await bot.send_message(user_id, "<b>👀 Ваше сообщение прочитано администратором!</b>")
+                    db_query("UPDATE msgs SET is_read = 1 WHERE admin_msg_id = ?", (m.reply_to_message.message_id,), commit=True)
+                await bot.send_message(user_id, "<b>📩 Вам пришел ответ от администратора!</b>")
+                await m.copy_to(user_id)
+                await m.answer("✅ Отправлено!")
+            except:
+                await m.answer("❌ Ошибка доставки.")
+
+    @dp.message(Form.waiting_for_msg)
+    async def handle_msg(m: Message, state: FSMContext):
+        if m.from_user.id == ADMIN_ID: return
+        user_name = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+        db_query("INSERT INTO users (user_id, name, count) VALUES (?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET name = ?, count = count + 1", 
+                 (m.from_user.id, user_name, user_name), commit=True)
+        header = "<b>💬 У тебя новое анонимное сообщение!</b>\n\n"
+        footer = "\n\n<i>↪️ Свайпни для ответа.</i>"
+        try:
+            if m.text:
+                sent = await bot.send_message(ADMIN_ID, f"{header}<blockquote>{m.text}</blockquote>{footer}")
+            else:
+                cap = m.caption if m.caption else "(Медиафайл)"
+                txt_header = await bot.send_message(ADMIN_ID, f"{header}<blockquote>{cap}</blockquote>{footer}")
+                sent = await m.copy_message(ADMIN_ID, m.chat.id, m.message_id, reply_to_message_id=txt_header.message_id)
+            db_query("INSERT INTO msgs (admin_msg_id, user_id) VALUES (?, ?)", (sent.message_id, m.from_user.id), commit=True)
+            await m.answer("🚀 <b>Доставлено!</b>", reply_markup=main_kb)
+        except:
+            await m.answer("❌ Ошибка отправки.")
+        await state.clear()
+
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
